@@ -1,0 +1,312 @@
+//+------------------------------------------------------------------+
+//|                    Advanced Trailing Stop EA - Buy & Sell.mq5   |
+//|                        Combined Buy and Sell Trading System     |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025"
+#property version   "1.00"
+#property strict
+
+// Include the Trade.mqh file
+#include <Trade\Trade.mqh>
+
+// Create an instance of CTrade
+CTrade trade;
+
+// Global variables
+string _symbol;
+
+// Input parameters for trading
+input group "=== Trading Parameters ==="
+input double MaxSpreadPoints = 20;       // Maximum allowed spread in points
+input double LotSize = 0.10;             // Position size
+input int MaxPositions = 2;              // Maximum number of positions per direction
+
+input group "=== Buy Position Settings ==="
+input double BuyInitialStopPoints = 1000;   // Initial stop loss for buy positions in points
+input double BuyTakeProfitPoints = 500;     // Take profit for buy positions in points
+input double BuyTrailingStopPoints = 150;   // Trailing stop distance for buy positions in points
+input double BuyTrailingStepPoints = 10;    // Step to move buy stop loss by
+
+input group "=== Sell Position Settings ==="
+input double SellInitialStopPoints = 500;   // Initial stop loss for sell positions in points
+input double SellTakeProfitPoints = 1000;   // Take profit for sell positions in points
+input double SellTrailingStopPoints = 150;  // Trailing stop distance for sell positions in points
+input double SellTrailingStepPoints = 10;   // Step to move sell stop loss by
+
+input group "=== Advanced Settings ==="
+input int MagicNumber = 123456;             // Magic number for trade identification
+input bool EnableBuyTrading = true;         // Enable buy position trading
+input bool EnableSellTrading = true;        // Enable sell position trading
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Initialize global variables
+   _symbol = Symbol();
+   
+   // Set magic number for easier trade identification
+   trade.SetExpertMagicNumber(MagicNumber);
+   
+   // Validate input parameters
+   if(MaxSpreadPoints <= 0)
+   {
+      Print("Error: MaxSpreadPoints must be greater than 0");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   
+   if(LotSize <= 0)
+   {
+      Print("Error: LotSize must be greater than 0");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   
+   Print("=== Advanced Trailing Stop EA Initialized ===");
+   Print("Symbol: ", _symbol);
+   Print("Magic Number: ", MagicNumber);
+   Print("Buy Trading: ", EnableBuyTrading ? "Enabled" : "Disabled");
+   Print("Sell Trading: ", EnableSellTrading ? "Enabled" : "Disabled");
+   Print("Max Positions per direction: ", MaxPositions);
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("=== Advanced Trailing Stop EA Deinitialized ===");
+   Print("Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Get current market prices
+   double ask = NormalizeDouble(SymbolInfoDouble(_symbol, SYMBOL_ASK), _Digits);
+   double bid = NormalizeDouble(SymbolInfoDouble(_symbol, SYMBOL_BID), _Digits);
+   double point = Point();
+   
+   // Calculate spread in points
+   double spreadPoints = (ask - bid) / point;
+   
+   // Check if spread is acceptable for trading
+   if(spreadPoints > MaxSpreadPoints)
+   {
+      Print("Spread too wide: ", DoubleToString(spreadPoints, 1), " points (Max: ", MaxSpreadPoints, ")");
+      return;
+   }
+   
+   // Count current positions
+   int buyPositions = CountPositions(POSITION_TYPE_BUY);
+   int sellPositions = CountPositions(POSITION_TYPE_SELL);
+   
+   // Open new positions if needed
+   if(EnableBuyTrading && buyPositions < MaxPositions)
+   {
+      OpenBuyPosition(ask, point);
+   }
+   
+   if(EnableSellTrading && sellPositions < MaxPositions)
+   {
+      OpenSellPosition(bid, point);
+   }
+   
+   // Update trailing stops for all positions
+   UpdateTrailingStops(ask, bid, point);
+}
+
+//+------------------------------------------------------------------+
+//| Count positions by type for current symbol                       |
+//+------------------------------------------------------------------+
+int CountPositions(ENUM_POSITION_TYPE positionType = -1)
+{
+   int count = 0;
+   
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) == _symbol)
+      {
+         if(positionType == -1 || (int)PositionGetInteger(POSITION_TYPE) == positionType)
+         {
+            ulong magic = PositionGetInteger(POSITION_MAGIC);
+            if(magic == MagicNumber)
+               count++;
+         }
+      }
+   }
+   
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Open buy position                                                |
+//+------------------------------------------------------------------+
+bool OpenBuyPosition(double ask, double point)
+{
+   double stopLoss = NormalizeDouble(ask - BuyInitialStopPoints * point, _Digits);
+   double takeProfit = NormalizeDouble(ask + BuyTakeProfitPoints * point, _Digits);
+   
+   if(trade.Buy(LotSize, _symbol, ask, stopLoss, takeProfit, "Buy Order - Advanced EA"))
+   {
+      Print("=== BUY POSITION OPENED ===");
+      Print("Price: ", DoubleToString(ask, _Digits));
+      Print("Stop Loss: ", DoubleToString(stopLoss, _Digits));
+      Print("Take Profit: ", DoubleToString(takeProfit, _Digits));
+      Print("Lot Size: ", DoubleToString(LotSize, 2));
+      return true;
+   }
+   else
+   {
+      Print("Error opening buy position: ", GetLastError());
+      return false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open sell position                                               |
+//+------------------------------------------------------------------+
+bool OpenSellPosition(double bid, double point)
+{
+   double stopLoss = NormalizeDouble(bid + SellInitialStopPoints * point, _Digits);
+   double takeProfit = NormalizeDouble(bid - SellTakeProfitPoints * point, _Digits);
+   
+   if(trade.Sell(LotSize, _symbol, bid, stopLoss, takeProfit, "Sell Order - Advanced EA"))
+   {
+      Print("=== SELL POSITION OPENED ===");
+      Print("Price: ", DoubleToString(bid, _Digits));
+      Print("Stop Loss: ", DoubleToString(stopLoss, _Digits));
+      Print("Take Profit: ", DoubleToString(takeProfit, _Digits));
+      Print("Lot Size: ", DoubleToString(LotSize, 2));
+      return true;
+   }
+   else
+   {
+      Print("Error opening sell position: ", GetLastError());
+      return false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update trailing stops for all positions                          |
+//+------------------------------------------------------------------+
+void UpdateTrailingStops(double ask, double bid, double point)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      string positionSymbol = PositionGetSymbol(i);
+      
+      if(positionSymbol != _symbol)
+         continue;
+      
+      // Check if position belongs to this EA
+      ulong magic = PositionGetInteger(POSITION_MAGIC);
+      if(magic != MagicNumber)
+         continue;
+      
+      // Get position details
+      ulong ticket = PositionGetTicket(i);
+      int positionType = (int)PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double currentProfit = PositionGetDouble(POSITION_PROFIT);
+      
+      // Update trailing stop based on position type
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         UpdateBuyTrailingStop(ticket, ask, openPrice, currentSL, currentTP, point);
+      }
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         UpdateSellTrailingStop(ticket, bid, openPrice, currentSL, currentTP, point);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update trailing stop for buy positions                           |
+//+------------------------------------------------------------------+
+void UpdateBuyTrailingStop(ulong ticket, double ask, double openPrice, double currentSL, double currentTP, double point)
+{
+   // Calculate new trailing stop level
+   double newSL = NormalizeDouble(ask - BuyTrailingStopPoints * point, _Digits);
+   
+   // Check if position is in profit and if we should move the stop loss
+   // For buy position: price should be above open price and new SL should be above current SL
+   if(ask > openPrice && (newSL > currentSL || currentSL == 0))
+   {
+      // Ensure we move the SL by at least the minimum step
+      if(currentSL > 0 && (newSL - currentSL) < BuyTrailingStepPoints * point)
+      {
+         newSL = NormalizeDouble(currentSL + BuyTrailingStepPoints * point, _Digits);
+      }
+      
+      // Modify the position
+      if(trade.PositionModify(ticket, newSL, currentTP))
+      {
+         Print("=== BUY TRAILING STOP UPDATED ===");
+         Print("Ticket: #", ticket);
+         Print("Old SL: ", DoubleToString(currentSL, _Digits));
+         Print("New SL: ", DoubleToString(newSL, _Digits));
+         Print("Current Ask: ", DoubleToString(ask, _Digits));
+      }
+      else
+      {
+         Print("Error modifying buy position #", ticket, " Error: ", GetLastError());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update trailing stop for sell positions                          |
+//+------------------------------------------------------------------+
+void UpdateSellTrailingStop(ulong ticket, double bid, double openPrice, double currentSL, double currentTP, double point)
+{
+   // Calculate new trailing stop level
+   double newSL = NormalizeDouble(bid + SellTrailingStopPoints * point, _Digits);
+   
+   // Check if position is in profit and if we should move the stop loss
+   // For sell position: price should be below open price and new SL should be below current SL
+   if(bid < openPrice && (newSL < currentSL || currentSL == 0))
+   {
+      // Ensure we move the SL by at least the minimum step
+      if(currentSL > 0 && (currentSL - newSL) < SellTrailingStepPoints * point)
+      {
+         newSL = NormalizeDouble(currentSL - SellTrailingStepPoints * point, _Digits);
+      }
+      
+      // Modify the position
+      if(trade.PositionModify(ticket, newSL, currentTP))
+      {
+         Print("=== SELL TRAILING STOP UPDATED ===");
+         Print("Ticket: #", ticket);
+         Print("Old SL: ", DoubleToString(currentSL, _Digits));
+         Print("New SL: ", DoubleToString(newSL, _Digits));
+         Print("Current Bid: ", DoubleToString(bid, _Digits));
+      }
+      else
+      {
+         Print("Error modifying sell position #", ticket, " Error: ", GetLastError());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get readable position type string                                |
+//+------------------------------------------------------------------+
+string GetPositionTypeString(int positionType)
+{
+   switch(positionType)
+   {
+      case POSITION_TYPE_BUY:  return "BUY";
+      case POSITION_TYPE_SELL: return "SELL";
+      default: return "UNKNOWN";
+   }
+}
+
+//+------------------------------------------------------------------+
