@@ -1,0 +1,672 @@
+//+------------------------------------------------------------------+
+//|                                            .mq5 |
+//|                                  Copyright 2025, Your Name       |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Your Name"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\AccountInfo.mqh>
+
+// Trade objects
+CTrade trade;
+CPositionInfo position;
+CAccountInfo account;
+
+// Input parameters - Signal Settings
+input group "=== Signal Parameters ==="
+input int RSI_Period = 14;
+input int RSI_Overbought = 70;
+input int RSI_Oversold = 30;
+input int MACD_Fast = 12;
+input int MACD_Slow = 26;
+input int MACD_Signal = 9;
+input int EMA_Period = 20;
+input int BB_Period = 20;
+input double BB_Deviation = 2.0;
+input int Volume_Spike_Factor = 2;
+input double Support_Resistance_Threshold = 5.0; // pips
+
+// Input parameters - Risk Management
+input group "=== Risk Management ==="
+input double Risk_Percent = 2.0;        // Risk per trade (% of account)
+input double Max_Lot_Size = 1.0;        // Maximum lot size per trade
+input double Min_Lot_Size = 0.01;       // Minimum lot size per trade
+input int Stop_Loss_Pips = 30;          // Stop loss in pips
+input int Take_Profit_Pips = 60;        // Take profit in pips
+input bool Use_Trailing_Stop = true;    // Enable trailing stop
+input int Trailing_Stop_Pips = 20;      // Trailing stop distance in pips
+input int Trailing_Step_Pips = 5;       // Trailing step in pips
+
+// Input parameters - Trading Settings
+input group "=== Trading Settings ==="
+input bool Filter_Trading_Hours = true;  // Filter trading hours
+input int Max_Positions = 1;             // Maximum number of positions
+input int Magic_Number = 123456;         // EA magic number
+input bool Show_Alerts = true;           // Show alerts
+input string Trade_Comment = "XAUUSD_Scalping_Pro";
+
+// Input parameters - Advanced Settings
+input group "=== Advanced Settings ==="
+input bool Use_Break_Even = true;        // Move SL to break even
+input int Break_Even_Pips = 20;         // Pips in profit to trigger break even
+input bool Use_Partial_Close = true;     // Use partial profit taking
+input double Partial_Close_Percent = 50; // Percentage to close at first TP
+input int Partial_Close_Pips = 30;      // Pips for partial close
+
+// Handles for indicators
+int RSI_Handle;
+int MACD_Handle;
+int BB_Handle;
+int Volume_Handle;
+int EMA_Handle;
+
+// Global variables
+datetime LastTradeTime = 0;
+datetime LastAlertTime = 0;
+double PointValue;
+double TickSize;
+double TickValue;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Set trade parameters
+    trade.SetExpertMagicNumber(Magic_Number);
+    trade.SetMarginMode();
+    trade.SetTypeFillingBySymbol(_Symbol);
+    trade.SetDeviationInPoints(10);
+    
+    // Initialize indicator handles
+    RSI_Handle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+    MACD_Handle = iMACD(_Symbol, PERIOD_CURRENT, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
+    BB_Handle = iBands(_Symbol, PERIOD_CURRENT, BB_Period, 0, BB_Deviation, PRICE_CLOSE);
+    Volume_Handle = iVolumes(_Symbol, PERIOD_CURRENT, VOLUME_TICK);
+    EMA_Handle = iMA(_Symbol, PERIOD_CURRENT, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+    
+    // Check handles
+    if(RSI_Handle == INVALID_HANDLE || MACD_Handle == INVALID_HANDLE || 
+       BB_Handle == INVALID_HANDLE || Volume_Handle == INVALID_HANDLE || EMA_Handle == INVALID_HANDLE)
+    {
+        Print("Error creating indicator handles");
+        return(INIT_FAILED);
+    }
+    
+    // Get symbol properties
+    PointValue = _Point;
+    TickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    TickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    
+    Print("XAUUSD Scalping Pro EA initialized successfully");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    IndicatorRelease(RSI_Handle);
+    IndicatorRelease(MACD_Handle);
+    IndicatorRelease(BB_Handle);
+    IndicatorRelease(Volume_Handle);
+    IndicatorRelease(EMA_Handle);
+    
+    Print("XAUUSD Scalping Pro EA deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Check if new bar
+    static datetime lastBarTime = 0;
+    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    
+    if(currentBarTime == lastBarTime)
+        return;
+    
+    lastBarTime = currentBarTime;
+    
+    // Main trading logic
+    if(IsNewBar())
+    {
+        CheckTrailingStop();
+        CheckBreakEven();
+        CheckPartialClose();
+        
+        // Check for new signals
+        if(ShouldTrade())
+        {
+            int signal = GetTradeSignal();
+            if(signal != 0)
+                ExecuteTrade(signal);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if new bar formed                                          |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+    static datetime lastBarTime = 0;
+    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    
+    if(currentBarTime != lastBarTime)
+    {
+        lastBarTime = currentBarTime;
+        return true;
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if should trade                                            |
+//+------------------------------------------------------------------+
+bool ShouldTrade()
+{
+    // Check maximum positions
+    if(GetOpenPositions() >= Max_Positions)
+        return false;
+    
+    // Check trading hours
+    if(Filter_Trading_Hours && !IsGoodTradingTime(TimeCurrent()))
+        return false;
+    
+    // Prevent multiple trades in same bar
+    if(iTime(_Symbol, PERIOD_CURRENT, 0) == LastTradeTime)
+        return false;
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get trade signal                                                 |
+//+------------------------------------------------------------------+
+int GetTradeSignal()
+{
+    MqlRates rates[];
+    if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 50, rates) < 50)
+        return 0;
+    
+    // Get indicator data
+    double rsi[], macd_main[], macd_signal[], bb_upper[], bb_lower[], bb_middle[], vol[], ema[];
+    
+    if(CopyBuffer(RSI_Handle, 0, 0, 20, rsi) <= 0) return 0;
+    if(CopyBuffer(MACD_Handle, 0, 0, 20, macd_main) <= 0) return 0;
+    if(CopyBuffer(MACD_Handle, 1, 0, 20, macd_signal) <= 0) return 0;
+    if(CopyBuffer(BB_Handle, 1, 0, 20, bb_upper) <= 0) return 0;
+    if(CopyBuffer(BB_Handle, 2, 0, 20, bb_lower) <= 0) return 0;
+    if(CopyBuffer(BB_Handle, 0, 0, 20, bb_middle) <= 0) return 0;
+    if(CopyBuffer(Volume_Handle, 0, 0, 20, vol) <= 0) return 0;
+    if(CopyBuffer(EMA_Handle, 0, 0, 20, ema) <= 0) return 0;
+    
+    int i = 1; // Current completed bar
+    
+    // Calculate support and resistance
+    double support = FindSupportLevel(rates, i, 20);
+    double resistance = FindResistanceLevel(rates, i, 20);
+    
+    // Volume analysis
+    double avgVolume = 0;
+    for(int j = 2; j <= 11; j++)
+        avgVolume += vol[j];
+    avgVolume /= 10;
+    
+    // Check buy signal
+    if(CheckBuySignal(rates, i, rsi, macd_main, macd_signal, bb_lower, vol, ema, support, avgVolume))
+        return 1; // Buy signal
+    
+    // Check sell signal
+    if(CheckSellSignal(rates, i, rsi, macd_main, macd_signal, bb_upper, vol, ema, resistance, avgVolume))
+        return -1; // Sell signal
+    
+    return 0; // No signal
+}
+
+//+------------------------------------------------------------------+
+//| Check Buy Signal                                                 |
+//+------------------------------------------------------------------+
+bool CheckBuySignal(const MqlRates &rates[], int i, const double &rsi[], const double &macd_main[], 
+                   const double &macd_signal[], const double &bb_lower[], const double &vol[], 
+                   const double &ema[], double support, double avgVolume)
+{
+    // 1. PRICE STRUCTURE
+    bool atSupport = (support > 0 && MathAbs(rates[i].low - support) <= Support_Resistance_Threshold * PointValue);
+    bool roundNumberSupport = IsRoundNumber(rates[i].low);
+    
+    if(!atSupport && !roundNumberSupport) return false;
+    
+    // 2. RSI DIVERGENCE CHECK
+    bool rsiOversold = rsi[i] < RSI_Oversold;
+    bool rsiDivergence = CheckBullishDivergence(rates, i, rsi);
+    
+    if(rsiOversold && !rsiDivergence && !atSupport) return false;
+    
+    // 3. CANDLESTICK PATTERNS
+    bool hammer = IsHammer(rates, i);
+    bool bullishEngulfing = IsBullishEngulfing(rates, i);
+    bool longLowerWick = (rates[i].low < rates[i].close - (rates[i].high - rates[i].low) * 0.6);
+    
+    // 4. VOLUME CONFIRMATION
+    bool volumeConfirmation = vol[i] > avgVolume * 1.5;
+    
+    // 5. TREND FILTER
+    bool aboveEMA = rates[i].close >= ema[i] || MathAbs(rates[i].close - ema[i]) <= 10 * PointValue;
+    
+    // 6. MACD CONFIRMATION
+    bool macdBullish = macd_main[i] > macd_signal[i] || 
+                      (macd_main[i+1] <= macd_signal[i+1] && macd_main[i] > macd_signal[i]);
+    
+    // 7. BOLLINGER BANDS
+    bool nearLowerBand = rates[i].close <= bb_lower[i] + 5 * PointValue;
+    
+    // FINAL BUY CONDITION
+    int confirmations = 0;
+    if(atSupport || roundNumberSupport) confirmations++;
+    if(rsiDivergence) confirmations++;
+    if(hammer || bullishEngulfing || longLowerWick) confirmations++;
+    if(volumeConfirmation) confirmations++;
+    if(macdBullish) confirmations++;
+    if(nearLowerBand) confirmations++;
+    
+    return (confirmations >= 3 && aboveEMA);
+}
+
+//+------------------------------------------------------------------+
+//| Check Sell Signal                                                |
+//+------------------------------------------------------------------+
+bool CheckSellSignal(const MqlRates &rates[], int i, const double &rsi[], const double &macd_main[], 
+                    const double &macd_signal[], const double &bb_upper[], const double &vol[], 
+                    const double &ema[], double resistance, double avgVolume)
+{
+    // 1. PRICE STRUCTURE
+    bool atResistance = (resistance > 0 && MathAbs(rates[i].high - resistance) <= Support_Resistance_Threshold * PointValue);
+    bool roundNumberResistance = IsRoundNumber(rates[i].high);
+    
+    // 2. RSI OVERBOUGHT
+    bool rsiOverbought = rsi[i] > RSI_Overbought;
+    bool rsiDivergence = CheckBearishDivergence(rates, i, rsi);
+    
+    // 3. CANDLESTICK PATTERNS
+    bool shootingStar = IsShootingStar(rates, i);
+    bool bearishEngulfing = IsBearishEngulfing(rates, i);
+    bool longUpperWick = (rates[i].high > rates[i].close + (rates[i].high - rates[i].low) * 0.6);
+    
+    // 4. VOLUME CONFIRMATION
+    bool volumeConfirmation = vol[i] > avgVolume * 1.5;
+    
+    // 5. MACD CONFIRMATION
+    bool macdBearish = macd_main[i] < macd_signal[i] || 
+                      (macd_main[i+1] >= macd_signal[i+1] && macd_main[i] < macd_signal[i]);
+    
+    // 6. BOLLINGER BANDS
+    bool nearUpperBand = rates[i].close >= bb_upper[i] - 5 * PointValue;
+    
+    // FINAL SELL CONDITION
+    int confirmations = 0;
+    if(atResistance || roundNumberResistance) confirmations++;
+    if(rsiOverbought || rsiDivergence) confirmations++;
+    if(shootingStar || bearishEngulfing || longUpperWick) confirmations++;
+    if(volumeConfirmation) confirmations++;
+    if(macdBearish) confirmations++;
+    if(nearUpperBand) confirmations++;
+    
+    return (confirmations >= 3);
+}
+
+//+------------------------------------------------------------------+
+//| Execute trade                                                    |
+//+------------------------------------------------------------------+
+void ExecuteTrade(int signal)
+{
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    if(signal == 1) // Buy
+    {
+        price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double sl = price - Stop_Loss_Pips * PointValue;
+        double tp = price + Take_Profit_Pips * PointValue;
+        double lots = CalculateLotSize(price, sl);
+        
+        if(trade.Buy(lots, _Symbol, price, sl, tp, Trade_Comment))
+        {
+            LastTradeTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+            if(Show_Alerts)
+                Alert("BUY ORDER OPENED: ", _Symbol, " at ", DoubleToString(price, _Digits));
+        }
+    }
+    else if(signal == -1) // Sell
+    {
+        price = bid;
+        double sl = price + Stop_Loss_Pips * PointValue;
+        double tp = price - Take_Profit_Pips * PointValue;
+        double lots = CalculateLotSize(price, sl);
+        
+        if(trade.Sell(lots, _Symbol, price, sl, tp, Trade_Comment))
+        {
+            LastTradeTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+            if(Show_Alerts)
+                Alert("SELL ORDER OPENED: ", _Symbol, " at ", DoubleToString(price, _Digits));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk                                 |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double entry, double sl)
+{
+    double balance = account.Balance();
+    double riskAmount = balance * Risk_Percent / 100.0;
+    double slDistance = MathAbs(entry - sl);
+    
+    if(slDistance == 0)
+        return Min_Lot_Size;
+    
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double moneyPerTick = tickValue / tickSize;
+    
+    double lots = riskAmount / (slDistance * moneyPerTick);
+    
+    // Normalize lot size
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    lots = MathMax(lots, Min_Lot_Size);
+    lots = MathMin(lots, Max_Lot_Size);
+    lots = MathMin(lots, maxLot);
+    lots = MathMax(lots, minLot);
+    
+    // Round to step
+    lots = MathFloor(lots / stepLot) * stepLot;
+    
+    return lots;
+}
+
+//+------------------------------------------------------------------+
+//| Get number of open positions                                     |
+//+------------------------------------------------------------------+
+int GetOpenPositions()
+{
+    int count = 0;
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        if(position.SelectByIndex(i))
+        {
+            if(position.Symbol() == _Symbol && position.Magic() == Magic_Number)
+                count++;
+        }
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check trailing stop                                              |
+//+------------------------------------------------------------------+
+void CheckTrailingStop()
+{
+    if(!Use_Trailing_Stop) return;
+    
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        if(position.SelectByIndex(i))
+        {
+            if(position.Symbol() == _Symbol && position.Magic() == Magic_Number)
+            {
+                double currentPrice = (position.PositionType() == POSITION_TYPE_BUY) ? 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                
+                double newSL = 0;
+                
+                if(position.PositionType() == POSITION_TYPE_BUY)
+                {
+                    newSL = currentPrice - Trailing_Stop_Pips * PointValue;
+                    if(newSL > position.StopLoss() + Trailing_Step_Pips * PointValue)
+                    {
+                        trade.PositionModify(position.Ticket(), newSL, position.TakeProfit());
+                    }
+                }
+                else
+                {
+                    newSL = currentPrice + Trailing_Stop_Pips * PointValue;
+                    if(newSL < position.StopLoss() - Trailing_Step_Pips * PointValue)
+                    {
+                        trade.PositionModify(position.Ticket(), newSL, position.TakeProfit());
+                    }
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check break even                                                 |
+//+------------------------------------------------------------------+
+void CheckBreakEven()
+{
+    if(!Use_Break_Even) return;
+    
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        if(position.SelectByIndex(i))
+        {
+            if(position.Symbol() == _Symbol && position.Magic() == Magic_Number)
+            {
+                double currentPrice = (position.PositionType() == POSITION_TYPE_BUY) ? 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                
+                double profit = 0;
+                if(position.PositionType() == POSITION_TYPE_BUY)
+                    profit = currentPrice - position.PriceOpen();
+                else
+                    profit = position.PriceOpen() - currentPrice;
+                
+                if(profit >= Break_Even_Pips * PointValue)
+                {
+                    if((position.PositionType() == POSITION_TYPE_BUY && position.StopLoss() < position.PriceOpen()) ||
+                       (position.PositionType() == POSITION_TYPE_SELL && position.StopLoss() > position.PriceOpen()))
+                    {
+                        trade.PositionModify(position.Ticket(), position.PriceOpen(), position.TakeProfit());
+                    }
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check partial close                                              |
+//+------------------------------------------------------------------+
+void CheckPartialClose()
+{
+    if(!Use_Partial_Close) return;
+    
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        if(position.SelectByIndex(i))
+        {
+            if(position.Symbol() == _Symbol && position.Magic() == Magic_Number)
+            {
+                double currentPrice = (position.PositionType() == POSITION_TYPE_BUY) ? 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                
+                double profit = 0;
+                if(position.PositionType() == POSITION_TYPE_BUY)
+                    profit = currentPrice - position.PriceOpen();
+                else
+                    profit = position.PriceOpen() - currentPrice;
+                
+                if(profit >= Partial_Close_Pips * PointValue)
+                {
+                    double closeVolume = position.Volume() * Partial_Close_Percent / 100.0;
+                    closeVolume = NormalizeDouble(closeVolume, 2);
+                    
+                    if(closeVolume >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+                    {
+                        trade.PositionClosePartial(position.Ticket(), closeVolume);
+                    }
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Support and Resistance Functions                                |
+//+------------------------------------------------------------------+
+double FindSupportLevel(const MqlRates &rates[], int current, int lookback)
+{
+    double minLow = rates[current].low;
+    int touchCount = 0;
+    
+    for(int i = current + 1; i <= current + lookback && i < ArraySize(rates); i++)
+    {
+        if(MathAbs(rates[i].low - minLow) <= Support_Resistance_Threshold * PointValue)
+            touchCount++;
+        else if(rates[i].low < minLow)
+        {
+            minLow = rates[i].low;
+            touchCount = 1;
+        }
+    }
+    
+    return (touchCount >= 2) ? minLow : 0;
+}
+
+double FindResistanceLevel(const MqlRates &rates[], int current, int lookback)
+{
+    double maxHigh = rates[current].high;
+    int touchCount = 0;
+    
+    for(int i = current + 1; i <= current + lookback && i < ArraySize(rates); i++)
+    {
+        if(MathAbs(rates[i].high - maxHigh) <= Support_Resistance_Threshold * PointValue)
+            touchCount++;
+        else if(rates[i].high > maxHigh)
+        {
+            maxHigh = rates[i].high;
+            touchCount = 1;
+        }
+    }
+    
+    return (touchCount >= 2) ? maxHigh : 0;
+}
+
+//+------------------------------------------------------------------+
+//| Divergence Functions                                             |
+//+------------------------------------------------------------------+
+bool CheckBullishDivergence(const MqlRates &rates[], int i, const double &rsi[])
+{
+    if(i + 10 >= ArraySize(rates)) return false;
+    
+    int prevLow = -1;
+    for(int j = i + 5; j <= i + 15 && j < ArraySize(rates); j++)
+    {
+        if(j > 0 && j < ArraySize(rates) - 1)
+        {
+            if(rates[j].low < rates[j-1].low && rates[j].low < rates[j+1].low)
+            {
+                prevLow = j;
+                break;
+            }
+        }
+    }
+    
+    if(prevLow == -1) return false;
+    
+    return (rates[i].low < rates[prevLow].low && rsi[i] > rsi[prevLow]);
+}
+
+bool CheckBearishDivergence(const MqlRates &rates[], int i, const double &rsi[])
+{
+    if(i + 10 >= ArraySize(rates)) return false;
+    
+    int prevHigh = -1;
+    for(int j = i + 5; j <= i + 15 && j < ArraySize(rates); j++)
+    {
+        if(j > 0 && j < ArraySize(rates) - 1)
+        {
+            if(rates[j].high > rates[j-1].high && rates[j].high > rates[j+1].high)
+            {
+                prevHigh = j;
+                break;
+            }
+        }
+    }
+    
+    if(prevHigh == -1) return false;
+    
+    return (rates[i].high > rates[prevHigh].high && rsi[i] < rsi[prevHigh]);
+}
+
+//+------------------------------------------------------------------+
+//| Utility Functions                                                |
+//+------------------------------------------------------------------+
+bool IsRoundNumber(double price)
+{
+    double rounded50 = MathRound(price * 2) / 2.0;
+    double rounded00 = MathRound(price);
+    
+    return (MathAbs(price - rounded50) <= 2 * PointValue || 
+            MathAbs(price - rounded00) <= 2 * PointValue);
+}
+
+bool IsGoodTradingTime(datetime time)
+{
+    MqlDateTime dt;
+    TimeToStruct(time, dt);
+    
+    int hour = dt.hour;
+    return (hour >= 8 && hour <= 10) || (hour >= 13 && hour <= 15);
+}
+
+//+------------------------------------------------------------------+
+//| Candlestick Pattern Functions                                   |
+//+------------------------------------------------------------------+
+bool IsHammer(const MqlRates &rates[], int i)
+{
+    double body = MathAbs(rates[i].close - rates[i].open);
+    double lowerWick = MathMin(rates[i].open, rates[i].close) - rates[i].low;
+    double upperWick = rates[i].high - MathMax(rates[i].open, rates[i].close);
+    
+    return (lowerWick > body * 2 && upperWick < body * 0.5);
+}
+
+bool IsShootingStar(const MqlRates &rates[], int i)
+{
+    double body = MathAbs(rates[i].close - rates[i].open);
+    double upperWick = rates[i].high - MathMax(rates[i].open, rates[i].close);
+    double lowerWick = MathMin(rates[i].open, rates[i].close) - rates[i].low;
+    
+    return (upperWick > body * 2 && lowerWick < body * 0.5);
+}
+
+bool IsBullishEngulfing(const MqlRates &rates[], int i)
+{
+    if(i + 1 >= ArraySize(rates)) return false;
+    
+    return (rates[i+1].close < rates[i+1].open && rates[i].close > rates[i].open && 
+            rates[i].open < rates[i+1].close && rates[i].close > rates[i+1].open);
+}
+
+bool IsBearishEngulfing(const MqlRates &rates[], int i)
+{
+    if(i + 1 >= ArraySize(rates)) return false;
+    
+    return (rates[i+1].close > rates[i+1].open && rates[i].close < rates[i].open && 
+            rates[i].open > rates[i+1].close && rates[i].close < rates[i+1].open);
+}
