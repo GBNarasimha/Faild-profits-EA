@@ -1,0 +1,1327 @@
+//+------------------------------------------------------------------+
+//|                                                .mq5 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "1.03"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\AccountInfo.mqh>
+
+//--- Input parameters
+input group "Trend Detection Parameters"
+input double ATRwithTrendFactor = 4.5;         // ATR with trend factor
+input double ATRagainstTrendFactor = 1.5;      // ATR against trend factor
+input int    ATRperiod = 14;                   // ATR period
+
+input group "Trading Parameters"
+input double LotSize = 0.1;                    // Lot size
+input double RiskPercent = 2.0;                // Risk percentage per trade
+input bool   UseFixedLot = true;               // Use fixed lot size
+input int    StopLossPips = 100;               // Stop loss in pips
+input int    TakeProfitPips = 200;             // Take profit in pips
+input bool   UseATRStops = true;               // Use ATR for stops
+input double ATRMultiplierSL = 2.0;            // ATR multiplier for stop loss
+input double ATRMultiplierTP = 4.0;            // ATR multiplier for take profit
+
+input group "Account Protection"
+input bool   UseAccountProtection = true;      // Enable account protection
+input double MaxDrawdownPercent = 15.0;        // Maximum drawdown percentage
+input double MinEquityPercent = 80.0;          // Minimum equity percentage of balance
+input double DailyLossLimitPercent = 5.0;      // Daily loss limit percentage
+input int    MaxConsecutiveLosses = 5;         // Maximum consecutive losses
+input bool   StopTradingOnProtection = true;   // Stop trading when protection triggered
+input bool   CloseAllOnProtection = false;     // Close all positions when protection triggered
+input bool   NotifyOnProtection = true;        // Send notifications on protection triggers
+
+input group "Trading Sessions"
+input bool   AsianSessionTrading = true;       // Allow trading during Asian session
+input bool   EuropeanSessionTrading = true;    // Allow trading during European session
+input bool   NewYorkSessionTrading = true;     // Allow trading during New York session
+input string AsianSessionStart = "00:00";      // Asian session start time (GMT)
+input string AsianSessionEnd = "09:00";        // Asian session end time (GMT)
+input string EuropeanSessionStart = "07:00";   // European session start time (GMT)
+input string EuropeanSessionEnd = "16:00";     // European session end time (GMT)
+input string NewYorkSessionStart = "13:00";    // New York session start time (GMT)
+input string NewYorkSessionEnd = "22:00";      // New York session end time (GMT)
+
+input group "Break-Even Protection"
+input bool   UseBreakEven = true;              // Enable break-even protection
+input double BreakEvenTriggerPips = 50;        // Pips profit to trigger break-even
+input double BreakEvenOffsetPips = 5;          // Pips beyond entry for break-even SL
+input bool   UseATRBreakEven = true;           // Use ATR for break-even calculations
+input double ATRBreakEvenTrigger = 1.0;        // ATR multiplier for break-even trigger
+input double ATRBreakEvenOffset = 0.2;         // ATR multiplier for break-even offset
+
+input group "Partial Trailing Stop"
+input bool   UsePartialTrailing = true;        // Enable partial trailing stop
+input double TrailingStartPips = 100;          // Pips profit to start trailing
+input double TrailingStepPips = 20;            // Trailing step in pips
+input double TrailingStopPips = 30;            // Trailing stop distance in pips
+input bool   UseATRTrailing = true;            // Use ATR for trailing calculations
+input double ATRTrailingStart = 2.0;           // ATR multiplier to start trailing
+input double ATRTrailingStep = 0.5;            // ATR multiplier for trailing step
+input double ATRTrailingStop = 1.0;            // ATR multiplier for trailing stop distance
+
+input group "Visual Parameters"
+input color  ColorStartUpTrend = clrGreen;     // Start Up Trend Color
+input color  ColorStartDownTrend = clrRed;     // Start Down Trend Color
+input color  ColorEndTrend = clrPurple;        // End Trend Color
+input color  ColorBoth = clrGray;              // Color when start and end trend are the same
+input bool   ShowLabels = true;                // Show text labels
+input bool   ShowArrows = true;                // Show arrow indicators
+input int    ArrowSize = 3;                    // Arrow size (1-5)
+input int    ArrowUpCode = 233;                // Arrow up code (wingdings)
+input int    ArrowDownCode = 234;              // Arrow down code (wingdings)
+
+input group "General Parameters"
+input int    MagicNumber = 123456;             // Magic number
+input string EAComment = "TrendFinder EA";     // EA comment
+
+//--- Global variables
+bool endTrend = false;
+double fullTrendChecker = 0.0;
+double counterTrendChecker = 0.1;
+bool UpTrend = false;
+bool DownTrend = false;
+datetime StartTrendBarTime = 0;
+datetime EndTrendBarTime = 0;
+datetime previous_EndTrendBarTime = 0;
+double EndTrendClose = 0.0;
+bool reversal = false;
+double endTrendATR = 0.0;
+double startTrendATR = 0.0;
+double upWick = 0.0;
+double downWick = 0.0;
+
+//--- Trading objects
+CTrade trade;
+CPositionInfo position;
+CAccountInfo account;
+
+//--- ATR handle
+int atr_handle;
+
+//--- Last signal tracking
+datetime lastSignalTime = 0;
+int lastSignalType = 0; // 1 = buy, -1 = sell, 0 = none
+
+//--- Break-even and trailing variables
+bool breakEvenActivated = false;
+double lastTrailingPrice = 0.0;
+double originalStopLoss = 0.0;
+datetime positionOpenTime = 0;
+
+//--- Session variables
+int AsianStartHour, AsianStartMinute, AsianEndHour, AsianEndMinute;
+int EuropeanStartHour, EuropeanStartMinute, EuropeanEndHour, EuropeanEndMinute;
+int NewYorkStartHour, NewYorkStartMinute, NewYorkEndHour, NewYorkEndMinute;
+
+//--- Account protection variables
+double initialBalance = 0.0;
+double maxEquityLevel = 0.0;
+double dailyStartBalance = 0.0;
+datetime lastDayCheck = 0;
+int consecutiveLosses = 0;
+bool protectionTriggered = false;
+bool tradingDisabled = false;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    //--- Create ATR indicator
+    atr_handle = iATR(_Symbol, _Period, ATRperiod);
+    if(atr_handle == INVALID_HANDLE)
+    {
+        Print("Failed to create ATR indicator");
+        return(INIT_FAILED);
+    }
+    
+    //--- Initialize trading objects
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetMarginMode();
+    trade.SetTypeFillingBySymbol(_Symbol);
+    
+    //--- Initialize variables
+    endTrend = false;
+    fullTrendChecker = 0.0;
+    counterTrendChecker = 0.1;
+    UpTrend = false;
+    DownTrend = false;
+    reversal = false;
+    endTrendATR = 0.0;
+    startTrendATR = 0.0;
+    lastSignalTime = 0;
+    lastSignalType = 0;
+    
+    //--- Initialize break-even and trailing variables
+    breakEvenActivated = false;
+    lastTrailingPrice = 0.0;
+    originalStopLoss = 0.0;
+    positionOpenTime = 0;
+    
+    //--- Initialize account protection variables
+    if(UseAccountProtection)
+    {
+        initialBalance = account.Balance();
+        maxEquityLevel = account.Equity();
+        dailyStartBalance = account.Balance();
+        lastDayCheck = TimeCurrent();
+        consecutiveLosses = 0;
+        protectionTriggered = false;
+        tradingDisabled = false;
+        
+        Print("Account Protection Initialized:");
+        Print("Initial Balance: ", initialBalance);
+        Print("Max Drawdown Limit: ", MaxDrawdownPercent, "%");
+        Print("Min Equity Limit: ", MinEquityPercent, "%");
+        Print("Daily Loss Limit: ", DailyLossLimitPercent, "%");
+        Print("Max Consecutive Losses: ", MaxConsecutiveLosses);
+    }
+    
+    //--- Initialize session times
+    if(!InitializeSessionTimes())
+    {
+        Print("Failed to initialize session times");
+        return(INIT_FAILED);
+    }
+    
+    Print("TrendFinder EA initialized successfully");
+    Print("Trading Sessions Enabled: Asian=", AsianSessionTrading, 
+          ", European=", EuropeanSessionTrading, ", NewYork=", NewYorkSessionTrading);
+    
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize session times                                         |
+//+------------------------------------------------------------------+
+bool InitializeSessionTimes()
+{
+    //--- Parse Asian session times
+    if(!ParseTimeString(AsianSessionStart, AsianStartHour, AsianStartMinute) ||
+       !ParseTimeString(AsianSessionEnd, AsianEndHour, AsianEndMinute))
+    {
+        Print("Error parsing Asian session times");
+        return false;
+    }
+    
+    //--- Parse European session times
+    if(!ParseTimeString(EuropeanSessionStart, EuropeanStartHour, EuropeanStartMinute) ||
+       !ParseTimeString(EuropeanSessionEnd, EuropeanEndHour, EuropeanEndMinute))
+    {
+        Print("Error parsing European session times");
+        return false;
+    }
+    
+    //--- Parse New York session times
+    if(!ParseTimeString(NewYorkSessionStart, NewYorkStartHour, NewYorkStartMinute) ||
+       !ParseTimeString(NewYorkSessionEnd, NewYorkEndHour, NewYorkEndMinute))
+    {
+        Print("Error parsing New York session times");
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Parse time string (HH:MM format)                                |
+//+------------------------------------------------------------------+
+bool ParseTimeString(string timeStr, int &hour, int &minute)
+{
+    //--- Remove spaces
+    StringTrimLeft(timeStr);
+    StringTrimRight(timeStr);
+    
+    //--- Find colon position
+    int colonPos = StringFind(timeStr, ":");
+    if(colonPos == -1 || colonPos == 0 || colonPos == StringLen(timeStr) - 1)
+        return false;
+    
+    //--- Extract hour and minute
+    string hourStr = StringSubstr(timeStr, 0, colonPos);
+    string minuteStr = StringSubstr(timeStr, colonPos + 1);
+    
+    //--- Convert to integers
+    hour = (int)StringToInteger(hourStr);
+    minute = (int)StringToInteger(minuteStr);
+    
+    //--- Validate ranges
+    if(hour < 0 || hour > 23 || minute < 0 || minute > 59)
+        return false;
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check account protection status                                  |
+//+------------------------------------------------------------------+
+bool CheckAccountProtection()
+{
+    if(!UseAccountProtection)
+        return true; // No protection, allow trading
+    
+    if(tradingDisabled)
+        return false; // Trading already disabled
+    
+    double currentBalance = account.Balance();
+    double currentEquity = account.Equity();
+    
+    //--- Update maximum equity level
+    if(currentEquity > maxEquityLevel)
+        maxEquityLevel = currentEquity;
+    
+    //--- Check for new day (reset daily counters)
+    datetime currentTime = TimeCurrent();
+    MqlDateTime dt_current, dt_last;
+    TimeToStruct(currentTime, dt_current);
+    TimeToStruct(lastDayCheck, dt_last);
+    
+    if(dt_current.day != dt_last.day)
+    {
+        dailyStartBalance = currentBalance;
+        lastDayCheck = currentTime;
+        Print("New day detected. Daily balance reset to: ", dailyStartBalance);
+    }
+    
+    //--- Check maximum drawdown from peak equity
+    if(maxEquityLevel > 0)
+    {
+        double drawdownPercent = ((maxEquityLevel - currentEquity) / maxEquityLevel) * 100.0;
+        if(drawdownPercent >= MaxDrawdownPercent)
+        {
+            TriggerAccountProtection("MAXIMUM DRAWDOWN EXCEEDED", 
+                                   StringFormat("Drawdown: %.2f%% (Limit: %.2f%%)", 
+                                              drawdownPercent, MaxDrawdownPercent));
+            return false;
+        }
+    }
+    
+    //--- Check minimum equity percentage of balance
+    if(currentBalance > 0)
+    {
+        double equityPercent = (currentEquity / currentBalance) * 100.0;
+        if(equityPercent <= MinEquityPercent)
+        {
+            TriggerAccountProtection("MINIMUM EQUITY EXCEEDED", 
+                                   StringFormat("Equity: %.2f%% of Balance (Limit: %.2f%%)", 
+                                              equityPercent, MinEquityPercent));
+            return false;
+        }
+    }
+    
+    //--- Check daily loss limit
+    if(dailyStartBalance > 0)
+    {
+        double dailyLoss = dailyStartBalance - currentBalance;
+        double dailyLossPercent = (dailyLoss / dailyStartBalance) * 100.0;
+        if(dailyLossPercent >= DailyLossLimitPercent)
+        {
+            TriggerAccountProtection("DAILY LOSS LIMIT EXCEEDED", 
+                                   StringFormat("Daily Loss: %.2f%% (Limit: %.2f%%)", 
+                                              dailyLossPercent, DailyLossLimitPercent));
+            return false;
+        }
+    }
+    
+    //--- Check consecutive losses
+    if(consecutiveLosses >= MaxConsecutiveLosses)
+    {
+        TriggerAccountProtection("CONSECUTIVE LOSSES LIMIT EXCEEDED", 
+                               StringFormat("Consecutive Losses: %d (Limit: %d)", 
+                                          consecutiveLosses, MaxConsecutiveLosses));
+        return false;
+    }
+    
+    return true; // All protection checks passed
+}
+
+//+------------------------------------------------------------------+
+//| Trigger account protection                                       |
+//+------------------------------------------------------------------+
+void TriggerAccountProtection(string reason, string details)
+{
+    if(protectionTriggered)
+        return; // Already triggered
+    
+    protectionTriggered = true;
+    
+    Print("===== ACCOUNT PROTECTION TRIGGERED =====");
+    Print("Reason: ", reason);
+    Print("Details: ", details);
+    Print("Current Balance: ", account.Balance());
+    Print("Current Equity: ", account.Equity());
+    Print("========================================");
+    
+    //--- Send notification if enabled
+    if(NotifyOnProtection)
+    {
+        string message = StringFormat("ACCOUNT PROTECTION TRIGGERED\nReason: %s\nDetails: %s\nBalance: %.2f\nEquity: %.2f", 
+                                    reason, details, account.Balance(), account.Equity());
+        SendNotification(message);
+    }
+    
+    //--- Close all positions if enabled
+    if(CloseAllOnProtection)
+    {
+        CloseAllPositions();
+    }
+    
+    //--- Disable trading if enabled
+    if(StopTradingOnProtection)
+    {
+        tradingDisabled = true;
+        Print("Trading disabled due to account protection trigger");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions                                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+    int totalPositions = PositionsTotal();
+    
+    for(int i = totalPositions - 1; i >= 0; i--)
+    {
+        if(position.SelectByIndex(i))
+        {
+            if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+            {
+                if(trade.PositionClose(position.Ticket()))
+                {
+                    Print("Position closed due to account protection: Ticket ", position.Ticket());
+                }
+                else
+                {
+                    Print("Failed to close position: Ticket ", position.Ticket(), 
+                          " Error: ", trade.ResultRetcode());
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update consecutive losses counter                                |
+//+------------------------------------------------------------------+
+void UpdateConsecutiveLosses()
+{
+    if(!UseAccountProtection)
+        return;
+    
+    //--- Check if we have position history
+    HistorySelect(0, TimeCurrent());
+    int totalDeals = HistoryDealsTotal();
+    
+    if(totalDeals < 2)
+        return;
+    
+    //--- Get the last closed deal
+    ulong lastTicket = HistoryDealGetTicket(totalDeals - 1);
+    if(lastTicket == 0)
+        return;
+    
+    //--- Check if it's our deal
+    if(HistoryDealGetInteger(lastTicket, DEAL_MAGIC) != MagicNumber)
+        return;
+    
+    if(HistoryDealGetString(lastTicket, DEAL_SYMBOL) != _Symbol)
+        return;
+    
+    //--- Check deal type (only count position closures)
+    ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(lastTicket, DEAL_TYPE);
+    if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL)
+        return;
+    
+    //--- Check profit/loss
+    double profit = HistoryDealGetDouble(lastTicket, DEAL_PROFIT);
+    
+    if(profit < 0)
+    {
+        consecutiveLosses++;
+        Print("Consecutive losses updated: ", consecutiveLosses);
+    }
+    else if(profit > 0)
+    {
+        consecutiveLosses = 0; // Reset on profit
+        Print("Consecutive losses reset due to profit");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if current time is within trading session                 |
+//+------------------------------------------------------------------+
+bool IsWithinTradingSession()
+{
+    //--- Get current GMT time
+    datetime currentTime = TimeGMT();
+    MqlDateTime dt;
+    TimeToStruct(currentTime, dt);
+    
+    int currentHour = dt.hour;
+    int currentMinute = dt.min;
+    int currentTimeInMinutes = currentHour * 60 + currentMinute;
+    
+    //--- Check Asian session
+    if(AsianSessionTrading)
+    {
+        int asianStart = AsianStartHour * 60 + AsianStartMinute;
+        int asianEnd = AsianEndHour * 60 + AsianEndMinute;
+        
+        if(asianStart <= asianEnd)
+        {
+            // Normal case (doesn't cross midnight)
+            if(currentTimeInMinutes >= asianStart && currentTimeInMinutes <= asianEnd)
+                return true;
+        }
+        else
+        {
+            // Crosses midnight
+            if(currentTimeInMinutes >= asianStart || currentTimeInMinutes <= asianEnd)
+                return true;
+        }
+    }
+    
+    //--- Check European session
+    if(EuropeanSessionTrading)
+    {
+        int europeanStart = EuropeanStartHour * 60 + EuropeanStartMinute;
+        int europeanEnd = EuropeanEndHour * 60 + EuropeanEndMinute;
+        
+        if(europeanStart <= europeanEnd)
+        {
+            // Normal case (doesn't cross midnight)
+            if(currentTimeInMinutes >= europeanStart && currentTimeInMinutes <= europeanEnd)
+                return true;
+        }
+        else
+        {
+            // Crosses midnight
+            if(currentTimeInMinutes >= europeanStart || currentTimeInMinutes <= europeanEnd)
+                return true;
+        }
+    }
+    
+    //--- Check New York session
+    if(NewYorkSessionTrading)
+    {
+        int newYorkStart = NewYorkStartHour * 60 + NewYorkStartMinute;
+        int newYorkEnd = NewYorkEndHour * 60 + NewYorkEndMinute;
+        
+        if(newYorkStart <= newYorkEnd)
+        {
+            // Normal case (doesn't cross midnight)
+            if(currentTimeInMinutes >= newYorkStart && currentTimeInMinutes <= newYorkEnd)
+                return true;
+        }
+        else
+        {
+            // Crosses midnight
+            if(currentTimeInMinutes >= newYorkStart || currentTimeInMinutes <= newYorkEnd)
+                return true;
+        }
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get current active session name                                 |
+//+------------------------------------------------------------------+
+string GetCurrentSession()
+{
+    //--- Get current GMT time
+    datetime currentTime = TimeGMT();
+    MqlDateTime dt;
+    TimeToStruct(currentTime, dt);
+    
+    int currentHour = dt.hour;
+    int currentMinute = dt.min;
+    int currentTimeInMinutes = currentHour * 60 + currentMinute;
+    
+    string activeSessions = "";
+    
+    //--- Check Asian session
+    if(AsianSessionTrading)
+    {
+        int asianStart = AsianStartHour * 60 + AsianStartMinute;
+        int asianEnd = AsianEndHour * 60 + AsianEndMinute;
+        
+        bool inAsian = false;
+        if(asianStart <= asianEnd)
+        {
+            inAsian = (currentTimeInMinutes >= asianStart && currentTimeInMinutes <= asianEnd);
+        }
+        else
+        {
+            inAsian = (currentTimeInMinutes >= asianStart || currentTimeInMinutes <= asianEnd);
+        }
+        
+        if(inAsian)
+            activeSessions += "Asian ";
+    }
+    
+    //--- Check European session
+    if(EuropeanSessionTrading)
+    {
+        int europeanStart = EuropeanStartHour * 60 + EuropeanStartMinute;
+        int europeanEnd = EuropeanEndHour * 60 + EuropeanEndMinute;
+        
+        bool inEuropean = false;
+        if(europeanStart <= europeanEnd)
+        {
+            inEuropean = (currentTimeInMinutes >= europeanStart && currentTimeInMinutes <= europeanEnd);
+        }
+        else
+        {
+            inEuropean = (currentTimeInMinutes >= europeanStart || currentTimeInMinutes <= europeanEnd);
+        }
+        
+        if(inEuropean)
+            activeSessions += "European ";
+    }
+    
+    //--- Check New York session
+    if(NewYorkSessionTrading)
+    {
+        int newYorkStart = NewYorkStartHour * 60 + NewYorkStartMinute;
+        int newYorkEnd = NewYorkEndHour * 60 + NewYorkEndMinute;
+        
+        bool inNewYork = false;
+        if(newYorkStart <= newYorkEnd)
+        {
+            inNewYork = (currentTimeInMinutes >= newYorkStart && currentTimeInMinutes <= newYorkEnd);
+        }
+        else
+        {
+            inNewYork = (currentTimeInMinutes >= newYorkStart || currentTimeInMinutes <= newYorkEnd);
+        }
+        
+        if(inNewYork)
+            activeSessions += "NewYork ";
+    }
+    
+    return StringLen(activeSessions) > 0 ? activeSessions : "None";
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    //--- Release ATR handle
+    if(atr_handle != INVALID_HANDLE)
+        IndicatorRelease(atr_handle);
+    
+    //--- Remove all trend labels and arrows
+    ObjectsDeleteAll(0, "TrendStart_");
+    ObjectsDeleteAll(0, "TrendEnd_");
+    
+    Print("TrendFinder EA deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    //--- Check account protection first
+    if(!CheckAccountProtection())
+    {
+        return; // Protection triggered, skip trading
+    }
+    
+    //--- Update consecutive losses counter
+    UpdateConsecutiveLosses();
+    
+    //--- Manage existing positions
+    ManagePositions();
+    
+    //--- Check if new bar
+    static datetime lastBarTime = 0;
+    datetime currentBarTime = iTime(_Symbol, _Period, 0);
+    
+    if(currentBarTime == lastBarTime)
+        return;
+        
+    lastBarTime = currentBarTime;
+    
+    //--- Analyze trend only if trading is not disabled
+    if(!tradingDisabled)
+    {
+        AnalyzeTrend();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Position management function                                     |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+    //--- Check if we have a position
+    if(!PositionSelect(_Symbol))
+    {
+        //--- Reset tracking variables when no position
+        breakEvenActivated = false;
+        lastTrailingPrice = 0.0;
+        originalStopLoss = 0.0;
+        positionOpenTime = 0;
+        return;
+    }
+    
+    //--- Get position information
+    double openPrice = position.PriceOpen();
+    double currentSL = position.StopLoss();
+    double currentTP = position.TakeProfit();
+    ENUM_POSITION_TYPE posType = position.PositionType();
+    double volume = position.Volume();
+    
+    //--- Initialize tracking variables for new position
+    if(positionOpenTime == 0)
+    {
+        positionOpenTime = position.Time();
+        originalStopLoss = currentSL;
+        breakEvenActivated = false;
+        lastTrailingPrice = 0.0;
+    }
+    
+    //--- Get current prices
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double currentPrice = (posType == POSITION_TYPE_BUY) ? bid : ask;
+    
+    //--- Get current ATR
+    double atr_buffer[];
+    ArraySetAsSeries(atr_buffer, true);
+    if(CopyBuffer(atr_handle, 0, 0, 2, atr_buffer) <= 0)
+        return;
+    double currentATR = atr_buffer[0];
+    
+    //--- Calculate profit in points
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double profitPoints = 0.0;
+    
+    if(posType == POSITION_TYPE_BUY)
+    {
+        profitPoints = (currentPrice - openPrice) / point;
+    }
+    else
+    {
+        profitPoints = (openPrice - currentPrice) / point;
+    }
+    
+    //--- Break-even protection
+    if(UseBreakEven && !breakEvenActivated)
+    {
+        double breakEvenTrigger = UseATRBreakEven ? (currentATR * ATRBreakEvenTrigger) / point : BreakEvenTriggerPips;
+        
+        if(profitPoints >= breakEvenTrigger)
+        {
+            double breakEvenOffset = UseATRBreakEven ? (currentATR * ATRBreakEvenOffset) / point : BreakEvenOffsetPips;
+            double newSL = 0.0;
+            
+            if(posType == POSITION_TYPE_BUY)
+            {
+                newSL = openPrice + (breakEvenOffset * point);
+            }
+            else
+            {
+                newSL = openPrice - (breakEvenOffset * point);
+            }
+            
+            newSL = NormalizeDouble(newSL, digits);
+            
+            //--- Check if new SL is better than current
+            bool shouldUpdate = false;
+            if(posType == POSITION_TYPE_BUY && newSL > currentSL)
+                shouldUpdate = true;
+            else if(posType == POSITION_TYPE_SELL && newSL < currentSL)
+                shouldUpdate = true;
+            
+            if(shouldUpdate)
+            {
+                if(trade.PositionModify(_Symbol, newSL, currentTP))
+                {
+                    breakEvenActivated = true;
+                    Print("Break-even activated at: ", newSL);
+                }
+            }
+        }
+    }
+    
+    //--- Partial trailing stop
+    if(UsePartialTrailing)
+    {
+        double trailingStart = UseATRTrailing ? (currentATR * ATRTrailingStart) / point : TrailingStartPips;
+        
+        if(profitPoints >= trailingStart)
+        {
+            double trailingStep = UseATRTrailing ? (currentATR * ATRTrailingStep) / point : TrailingStepPips;
+            double trailingStop = UseATRTrailing ? (currentATR * ATRTrailingStop) / point : TrailingStopPips;
+            
+            //--- Initialize trailing price
+            if(lastTrailingPrice == 0.0)
+            {
+                lastTrailingPrice = currentPrice;
+            }
+            
+            //--- Check if price moved favorably by trailing step
+            double priceMovement = 0.0;
+            if(posType == POSITION_TYPE_BUY)
+            {
+                priceMovement = (currentPrice - lastTrailingPrice) / point;
+            }
+            else
+            {
+                priceMovement = (lastTrailingPrice - currentPrice) / point;
+            }
+            
+            if(priceMovement >= trailingStep)
+            {
+                double newSL = 0.0;
+                
+                if(posType == POSITION_TYPE_BUY)
+                {
+                    newSL = currentPrice - (trailingStop * point);
+                }
+                else
+                {
+                    newSL = currentPrice + (trailingStop * point);
+                }
+                
+                newSL = NormalizeDouble(newSL, digits);
+                
+                //--- Check if new SL is better than current
+                bool shouldUpdate = false;
+                if(posType == POSITION_TYPE_BUY && newSL > currentSL)
+                    shouldUpdate = true;
+                else if(posType == POSITION_TYPE_SELL && newSL < currentSL)
+                    shouldUpdate = true;
+                
+                if(shouldUpdate)
+                {
+                    if(trade.PositionModify(_Symbol, newSL, currentTP))
+                    {
+                        lastTrailingPrice = currentPrice;
+                        Print("Trailing stop updated to: ", newSL, " at price: ", currentPrice);
+                    }
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Trend analysis function                                          |
+//+------------------------------------------------------------------+
+void AnalyzeTrend()
+{
+    //--- Get bars data
+    int bars = iBars(_Symbol, _Period);
+    if(bars < ATRperiod + 2)
+        return;
+    
+    //--- Get ATR values
+    double atr_buffer[];
+    ArraySetAsSeries(atr_buffer, true);
+    if(CopyBuffer(atr_handle, 0, 0, bars, atr_buffer) <= 0)
+        return;
+    
+    //--- Get price data
+    datetime time[];
+    double open[], high[], low[], close[];
+    
+    ArraySetAsSeries(time, true);
+    ArraySetAsSeries(open, true);
+    ArraySetAsSeries(high, true);
+    ArraySetAsSeries(low, true);
+    ArraySetAsSeries(close, true);
+    
+    if(CopyTime(_Symbol, _Period, 0, bars, time) <= 0) return;
+    if(CopyOpen(_Symbol, _Period, 0, bars, open) <= 0) return;
+    if(CopyHigh(_Symbol, _Period, 0, bars, high) <= 0) return;
+    if(CopyLow(_Symbol, _Period, 0, bars, low) <= 0) return;
+    if(CopyClose(_Symbol, _Period, 0, bars, close) <= 0) return;
+    
+    //--- Process recent bars
+    for(int i = 1; i < MathMin(100, bars - 1); i++) // Limit to recent 100 bars for performance
+    {
+        //--- Calculate trend checker
+        if(i > 1)
+        {
+            fullTrendChecker += close[i] - close[i + 1];
+        }
+        
+        //--- Handle uptrend reversal detection
+        if(UpTrend && reversal)
+        {
+            counterTrendChecker += close[i] - close[i + 1];
+        }
+        else if(UpTrend && close[i] - close[i + 1] < 0.0 && MathAbs(counterTrendChecker - 0.1) < 0.001)
+        {
+            counterTrendChecker = close[i] - close[i + 1];
+            EndTrendBarTime = time[i + 1];
+            reversal = true;
+            EndTrendClose = close[i + 1];
+            endTrend = true;
+        }
+        
+        //--- Handle downtrend reversal detection
+        if(DownTrend && reversal)
+        {
+            counterTrendChecker += close[i] - close[i + 1];
+        }
+        else if(DownTrend && close[i] - close[i + 1] > 0.0 && MathAbs(counterTrendChecker + 0.1) < 0.001)
+        {
+            counterTrendChecker = close[i] - close[i + 1];
+            EndTrendBarTime = time[i + 1];
+            reversal = true;
+            EndTrendClose = close[i + 1];
+            endTrend = true;
+        }
+        
+        //--- Update end trend ATR
+        if(endTrend)
+        {
+            endTrendATR = atr_buffer[i + 1];
+            endTrend = false;
+        }
+        
+        //--- Calculate wicks
+        if(i > 1)
+        {
+            if(close[i] - close[i + 1] > 0.0)
+                upWick = high[i] - close[i];
+            else
+                upWick = high[i] - close[i];
+                
+            if(close[i] - close[i + 1] < 0.0)
+                downWick = low[i] - close[i];
+            else
+                downWick = low[i] - close[i];
+        }
+        
+        //--- Check for downtrend end (upward reversal) - BUY SIGNAL
+        if(counterTrendChecker + upWick >= (ATRagainstTrendFactor * endTrendATR) && DownTrend)
+        {
+            fullTrendChecker += (EndTrendClose - close[i]);
+            
+            if(fullTrendChecker <= -ATRwithTrendFactor * startTrendATR)
+            {
+                //--- Create visual markers
+                CreateTrendMarkers(true, i, time, close, bars);
+                
+                //--- Generate BUY signal (check session before executing)
+                if(time[i] != lastSignalTime && IsWithinTradingSession())
+                {
+                    string currentSession = GetCurrentSession();
+                    Print("BUY signal generated during session: ", currentSession);
+                    ExecuteTrade(ORDER_TYPE_BUY, atr_buffer[i]);
+                    lastSignalTime = time[i];
+                    lastSignalType = 1;
+                }
+                else if(time[i] != lastSignalTime && !IsWithinTradingSession())
+                {
+                    Print("BUY signal skipped - outside trading session. Current session: ", GetCurrentSession());
+                }
+                
+                previous_EndTrendBarTime = EndTrendBarTime;
+            }
+            
+            //--- Reset for new trend
+            ResetTrendVariables(i, time, open, close, atr_buffer, true);
+        }
+        
+        //--- Check for uptrend end (downward reversal) - SELL SIGNAL
+        else if(counterTrendChecker + downWick <= -(ATRagainstTrendFactor * endTrendATR) && UpTrend)
+        {
+            fullTrendChecker += (EndTrendClose - close[i]);
+            
+            if(fullTrendChecker >= ATRwithTrendFactor * startTrendATR)
+            {
+                //--- Create visual markers
+                CreateTrendMarkers(false, i, time, close, bars);
+                
+                //--- Generate SELL signal (check session before executing)
+                if(time[i] != lastSignalTime && IsWithinTradingSession())
+                {
+                    string currentSession = GetCurrentSession();
+                    Print("SELL signal generated during session: ", currentSession);
+                    ExecuteTrade(ORDER_TYPE_SELL, atr_buffer[i]);
+                    lastSignalTime = time[i];
+                    lastSignalType = -1;
+                }
+                else if(time[i] != lastSignalTime && !IsWithinTradingSession())
+                {
+                    Print("SELL signal skipped - outside trading session. Current session: ", GetCurrentSession());
+                }
+                
+                previous_EndTrendBarTime = EndTrendBarTime;
+            }
+            
+            //--- Reset for new trend
+            ResetTrendVariables(i, time, open, close, atr_buffer, false);
+        }
+        
+        //--- Handle reversal continuation
+        if(reversal && UpTrend && close[i] - close[i + 1] > 0.0 && counterTrendChecker > 0.0)
+        {
+            reversal = false;
+            counterTrendChecker = 0.1;
+        }
+        else if(reversal && DownTrend && close[i] - close[i + 1] < 0.0 && counterTrendChecker < 0.0)
+        {
+            reversal = false;
+            counterTrendChecker = -0.1;
+        }
+        
+        //--- Determine overall trend direction
+        if(fullTrendChecker > 0.0)
+        {
+            UpTrend = true;
+            DownTrend = false;
+        }
+        else if(fullTrendChecker < 0.0)
+        {
+            UpTrend = false;
+            DownTrend = true;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Execute trade function                                           |
+//+------------------------------------------------------------------+
+void ExecuteTrade(ENUM_ORDER_TYPE orderType, double currentATR)
+{
+    //--- Check if we already have a position
+    if(PositionSelect(_Symbol))
+    {
+        Print("Position already exists, skipping trade");
+        return;
+    }
+    
+    //--- Calculate lot size
+    double lotSize = LotSize;
+    if(!UseFixedLot)
+    {
+        lotSize = CalculateLotSize(currentATR);
+    }
+    
+    //--- Get current prices
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    
+    //--- Calculate stop loss and take profit
+    double sl = 0, tp = 0;
+    
+    if(orderType == ORDER_TYPE_BUY)
+    {
+        if(UseATRStops)
+        {
+            sl = ask - (currentATR * ATRMultiplierSL);
+            tp = ask + (currentATR * ATRMultiplierTP);
+        }
+        else
+        {
+            sl = ask - (StopLossPips * point * 10);
+            tp = ask + (TakeProfitPips * point * 10);
+        }
+    }
+    else // SELL
+    {
+        if(UseATRStops)
+        {
+            sl = bid + (currentATR * ATRMultiplierSL);
+            tp = bid - (currentATR * ATRMultiplierTP);
+        }
+        else
+        {
+            sl = bid + (StopLossPips * point * 10);
+            tp = bid - (TakeProfitPips * point * 10);
+        }
+    }
+    
+    //--- Normalize prices
+    sl = NormalizeDouble(sl, digits);
+    tp = NormalizeDouble(tp, digits);
+    
+    //--- Execute trade
+    bool result = false;
+    if(orderType == ORDER_TYPE_BUY)
+    {
+        result = trade.Buy(lotSize, _Symbol, ask, sl, tp, EAComment);
+    }
+    else
+    {
+        result = trade.Sell(lotSize, _Symbol, bid, sl, tp, EAComment);
+    }
+    
+    if(result)
+    {
+        //--- Reset position tracking variables for new trade
+        breakEvenActivated = false;
+        lastTrailingPrice = 0.0;
+        originalStopLoss = sl;
+        positionOpenTime = 0; // Will be set in ManagePositions
+        
+        Print("Trade executed: ", EnumToString(orderType), " ", lotSize, " lots at ", 
+              (orderType == ORDER_TYPE_BUY ? ask : bid), " SL: ", sl, " TP: ", tp);
+    }
+    else
+    {
+        Print("Trade failed: ", trade.ResultRetcode(), " - ", trade.ResultComment());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk                                |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double currentATR)
+{
+    double accountBalance = account.Balance();
+    double riskAmount = accountBalance * RiskPercent / 100.0;
+    
+    double stopLossPoints;
+    if(UseATRStops)
+    {
+        stopLossPoints = currentATR * ATRMultiplierSL;
+    }
+    else
+    {
+        stopLossPoints = StopLossPips * SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+    }
+    
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    
+    double lotSize = (riskAmount / (stopLossPoints / tickSize * tickValue));
+    
+    //--- Normalize lot size
+    lotSize = MathFloor(lotSize / lotStep) * lotStep;
+    lotSize = MathMax(lotSize, minLot);
+    lotSize = MathMin(lotSize, maxLot);
+    
+    return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| Reset trend variables                                            |
+//+------------------------------------------------------------------+
+void ResetTrendVariables(int bar_index, const datetime &time[], const double &open[], 
+                         const double &close[], const double &atr_buffer[], bool isUpTrend)
+{
+    if(isUpTrend)
+    {
+        if(counterTrendChecker < 0.0)
+        {
+            StartTrendBarTime = time[bar_index + 1];
+            startTrendATR = atr_buffer[bar_index + 1];
+            fullTrendChecker = close[bar_index] - open[bar_index];
+            counterTrendChecker = -0.1;
+            reversal = false;
+        }
+        else
+        {
+            StartTrendBarTime = EndTrendBarTime;
+            startTrendATR = endTrendATR;
+            fullTrendChecker = counterTrendChecker;
+            counterTrendChecker = 0.1;
+            UpTrend = true;
+            DownTrend = false;
+            reversal = false;
+        }
+    }
+    else
+    {
+        if(counterTrendChecker > 0.0)
+        {
+            StartTrendBarTime = time[bar_index + 1];
+            startTrendATR = atr_buffer[bar_index + 1];
+            fullTrendChecker = close[bar_index] - open[bar_index];
+            counterTrendChecker = 0.1;
+            reversal = false;
+        }
+        else
+        {
+            StartTrendBarTime = EndTrendBarTime;
+            startTrendATR = endTrendATR;
+            fullTrendChecker = counterTrendChecker;
+            counterTrendChecker = -0.1;
+            DownTrend = true;
+            UpTrend = false;
+            reversal = false;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Create trend markers                                             |
+//+------------------------------------------------------------------+
+void CreateTrendMarkers(bool isUpTrend, int bar_index, const datetime &time[], 
+                        const double &close[], int rates_total)
+{
+    string start_name = "TrendStart_" + TimeToString(StartTrendBarTime);
+    string end_name = "TrendEnd_" + TimeToString(EndTrendBarTime);
+    
+    double start_price = GetCloseAtTime(StartTrendBarTime, time, close, rates_total);
+    double end_price = GetCloseAtTime(EndTrendBarTime, time, close, rates_total);
+    
+    if(StartTrendBarTime == previous_EndTrendBarTime)
+    {
+        // Combined start and end
+        if(ShowLabels)
+        {
+            if(isUpTrend)
+            {
+                CreateTrendLabel(start_name + "_Label", StartTrendBarTime, start_price, 
+                               "Start Down and End Up Trend", ColorBoth, ANCHOR_UPPER);
+                CreateTrendLabel(end_name + "_Label", EndTrendBarTime, end_price, 
+                               "End Down Trend", ColorEndTrend, ANCHOR_LOWER);
+            }
+            else
+            {
+                CreateTrendLabel(start_name + "_Label", StartTrendBarTime, start_price, 
+                               "Start Up and End Down Trend", ColorBoth, ANCHOR_LOWER);
+                CreateTrendLabel(end_name + "_Label", EndTrendBarTime, end_price, 
+                               "End Up Trend", ColorEndTrend, ANCHOR_UPPER);
+            }
+        }
+        if(ShowArrows)
+        {
+            if(isUpTrend)
+            {
+                CreateTrendArrow(start_name + "_Arrow", StartTrendBarTime, start_price, 
+                               ArrowDownCode, ColorBoth, true);
+                CreateTrendArrow(end_name + "_Arrow", EndTrendBarTime, end_price, 
+                               ArrowUpCode, ColorEndTrend, false);
+            }
+            else
+            {
+                CreateTrendArrow(start_name + "_Arrow", StartTrendBarTime, start_price, 
+                               ArrowUpCode, ColorBoth, false);
+                CreateTrendArrow(end_name + "_Arrow", EndTrendBarTime, end_price, 
+                               ArrowDownCode, ColorEndTrend, true);
+            }
+        }
+    }
+    else
+    {
+        // Separate start and end
+        if(ShowLabels)
+        {
+            if(isUpTrend)
+            {
+                CreateTrendLabel(start_name + "_Label", StartTrendBarTime, start_price, 
+                               "Start Down Trend", ColorStartDownTrend, ANCHOR_UPPER);
+                CreateTrendLabel(end_name + "_Label", EndTrendBarTime, end_price, 
+                               "End Down Trend", ColorEndTrend, ANCHOR_LOWER);
+            }
+            else
+            {
+                CreateTrendLabel(start_name + "_Label", StartTrendBarTime, start_price, 
+                               "Start Up Trend", ColorStartUpTrend, ANCHOR_LOWER);
+                CreateTrendLabel(end_name + "_Label", EndTrendBarTime, end_price, 
+                               "End Up Trend", ColorEndTrend, ANCHOR_UPPER);
+            }
+        }
+        if(ShowArrows)
+        {
+            if(isUpTrend)
+            {
+                CreateTrendArrow(start_name + "_Arrow", StartTrendBarTime, start_price, 
+                               ArrowDownCode, ColorStartDownTrend, true);
+                CreateTrendArrow(end_name + "_Arrow", EndTrendBarTime, end_price, 
+                               ArrowUpCode, ColorEndTrend, false);
+            }
+            else
+            {
+                CreateTrendArrow(start_name + "_Arrow", StartTrendBarTime, start_price, 
+                               ArrowUpCode, ColorStartUpTrend, false);
+                CreateTrendArrow(end_name + "_Arrow", EndTrendBarTime, end_price, 
+                               ArrowDownCode, ColorEndTrend, true);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Create trend label                                               |
+//+------------------------------------------------------------------+
+void CreateTrendLabel(string name, datetime label_time, double price, string text, color label_color, ENUM_ANCHOR_POINT anchor)
+{
+    //--- Delete existing label if it exists
+    ObjectDelete(0, name);
+    
+    //--- Create new label
+    if(ObjectCreate(0, name, OBJ_TEXT, 0, label_time, price))
+    {
+        ObjectSetString(0, name, OBJPROP_TEXT, text);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, label_color);
+        ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+        ObjectSetInteger(0, name, OBJPROP_ANCHOR, anchor);
+        ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Create trend arrow                                               |
+//+------------------------------------------------------------------+
+void CreateTrendArrow(string name, datetime arrow_time, double price, int arrow_code, color arrow_color, bool above_candle)
+{
+    //--- Delete existing arrow if it exists
+    ObjectDelete(0, name);
+    
+    //--- Adjust price position based on arrow direction
+    double adjusted_price = price;
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    
+    if(above_candle)
+    {
+        // Position arrow above the candle
+        adjusted_price = price + (point * 50); // Adjust offset as needed
+    }
+    else
+    {
+        // Position arrow below the candle
+        adjusted_price = price - (point * 50); // Adjust offset as needed
+    }
+    
+    //--- Create new arrow
+    if(ObjectCreate(0, name, OBJ_ARROW, 0, arrow_time, adjusted_price))
+    {
+        ObjectSetInteger(0, name, OBJPROP_ARROWCODE, arrow_code);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, arrow_color);
+        ObjectSetInteger(0, name, OBJPROP_WIDTH, ArrowSize);
+        ObjectSetInteger(0, name, OBJPROP_BACK, false);
+        ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+        ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+        ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Get close price at specific time                                |
+//+------------------------------------------------------------------+
+double GetCloseAtTime(datetime search_time, const datetime &time[], const double &close[], int rates_total)
+{
+    for(int i = 0; i < rates_total; i++)
+    {
+        if(time[i] == search_time)
+            return close[i];
+    }
+    return 0.0; // Return 0 if time not found
+}
